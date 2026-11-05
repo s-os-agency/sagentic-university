@@ -9,7 +9,7 @@
 # 3. Liveness without noise — only write a marker when approaching the
 #    60-day GitHub inactivity cliff.
 # 4. Protection first — minimal permissions, timeouts, no secrets leakage,
-#    rate-limit aware.
+#    rate-limit aware, self-guard on this workflow file.
 #
 # Token budget on normal run: 0
 # Token budget on real signal: only the downstream agent you explicitly call.
@@ -63,25 +63,61 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
+
+          if [[ ! -f .github/workflows/zero-token-heartbeat.yml ]]; then
+            echo "CRITICAL: zero-token-heartbeat.yml is missing"
+            echo "signal=self_missing;" >> $GITHUB_OUTPUT
+            echo "need_marker=true" >> $GITHUB_OUTPUT
+            echo "days_since=999" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           LAST_COMMIT_TS=$(git log -1 --format=%ct)
           NOW_TS=$(date +%s)
           DAYS_SINCE=$(( (NOW_TS - LAST_COMMIT_TS) / 86400 ))
           echo "Days since last commit: $DAYS_SINCE"
+
           NEED_MARKER="false"
           if [[ "$DAYS_SINCE" -ge 50 || "$FORCE_MARKER" == "true" ]]; then
             NEED_MARKER="true"
           fi
           echo "need_marker=$NEED_MARKER" >> $GITHUB_OUTPUT
           echo "days_since=$DAYS_SINCE" >> $GITHUB_OUTPUT
+
           SIGNAL=""
-          FAILED=$(gh run list --status failure --limit 5 --json conclusion,name,createdAt --jq '[.[] | select(.createdAt > (now - 86400 | todate))] | length' 2>/dev/null || echo "0")
-          if [[ "$FAILED" -gt 0 ]]; then SIGNAL="${SIGNAL}failed_runs=${FAILED};"; fi
-          STALE_PRS=$(gh pr list --state open --json number,updatedAt --jq '[.[] | select((now - (.updatedAt | fromdateiso8601)) > 604800)] | length' 2>/dev/null || echo "0")
-          if [[ "$STALE_PRS" -gt 0 ]]; then SIGNAL="${SIGNAL}stale_prs=${STALE_PRS};"; fi
-          EXHAUSTED=$(gh issue list --state open --label "usageexhausted,bot-down" --json number --jq 'length' 2>/dev/null || echo "0")
-          if [[ "$EXHAUSTED" -gt 0 ]]; then SIGNAL="${SIGNAL}usageexhausted_or_botdown=${EXHAUSTED};"; fi
+          FAILED=$(gh run list --status failure --limit 8 --json createdAt \
+            --jq --argjson cutoff $((NOW_TS - 86400)) \
+            '[.[] | select((.createdAt | fromdateiso8601) > $cutoff)] | length' 2>/dev/null || echo "0")
+          if [[ "$FAILED" =~ ^[0-9]+$ && "$FAILED" -gt 0 ]]; then
+            SIGNAL="${SIGNAL}failed_runs=${FAILED};"
+          fi
+
+          STALE_PRS=$(gh pr list --state open --json number,updatedAt \
+            --jq --argjson cutoff $((NOW_TS - 604800)) \
+            '[.[] | select((.updatedAt | fromdateiso8601) < $cutoff)] | length' 2>/dev/null || echo "0")
+          if [[ "$STALE_PRS" =~ ^[0-9]+$ && "$STALE_PRS" -gt 0 ]]; then
+            SIGNAL="${SIGNAL}stale_prs=${STALE_PRS};"
+          fi
+
+          EXHAUSTED=$(gh issue list --state open --label "usageexhausted" --json number --jq 'length' 2>/dev/null || echo "0")
+          BOTDOWN=$(gh issue list --state open --label "bot-down" --json number --jq 'length' 2>/dev/null || echo "0")
+          if [[ "$EXHAUSTED" =~ ^[0-9]+$ && "$EXHAUSTED" -gt 0 ]]; then
+            SIGNAL="${SIGNAL}usageexhausted=${EXHAUSTED};"
+          fi
+          if [[ "$BOTDOWN" =~ ^[0-9]+$ && "$BOTDOWN" -gt 0 ]]; then
+            SIGNAL="${SIGNAL}bot_down=${BOTDOWN};"
+          fi
+
+          if git ls-files | grep -E '\.(env|pem|key|p12|pfx)$|credentials\.json|secrets\.ya?ml' >/dev/null 2>&1; then
+            SIGNAL="${SIGNAL}possible_secrets_in_tree;"
+          fi
+
           echo "signal=$SIGNAL" >> $GITHUB_OUTPUT
-          if [[ -n "$SIGNAL" ]]; then echo "Real signal: $SIGNAL"; else echo "No signal — silent (zero tokens)."; fi
+          if [[ -n "$SIGNAL" ]]; then
+            echo "Real signal detected: $SIGNAL"
+          else
+            echo "No actionable signal — remaining silent (zero tokens)."
+          fi
 
       - name: Write liveness marker (only if needed)
         if: steps.gate.outputs.need_marker == 'true' && (inputs.dry_run != 'true')
@@ -95,12 +131,12 @@ jobs:
           git config user.name "zero-token-heartbeat[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$MARKER"
-          git commit -m "chore(heartbeat): keep scheduled workflows alive (zero-token)" || true
+          git commit -m "chore(heartbeat): keep sagentic-university alive (zero-token)" || true
           git push origin HEAD:${{ github.ref_name }}
 
-      - name: Report
+      - name: Report (always)
         run: |
-          echo "### Zero-Token Heartbeat" >> $GITHUB_STEP_SUMMARY
+          echo "### Zero-Token Heartbeat Report" >> $GITHUB_STEP_SUMMARY
           echo "| Days since last commit | ${{ steps.gate.outputs.days_since }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Marker written | ${{ steps.gate.outputs.need_marker }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Signal | \`${{ steps.gate.outputs.signal || 'none' }}\` |" >> $GITHUB_STEP_SUMMARY
